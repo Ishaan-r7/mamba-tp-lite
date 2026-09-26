@@ -90,6 +90,8 @@ def main():
                      help="HF hub id to download, e.g. state-spaces/mamba-1.4b-hf")
     ap.add_argument("--backend", default="nccl", choices=["nccl", "gloo"])
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--allreduce-dtype", default="fp32", choices=["fp32", "fp16", "int8"],
+                     help="precision used for the AllReduce collective only (Phase 4)")
     ap.add_argument("--prompt-lens", type=int, nargs="+", default=[16, 64, 256])
     ap.add_argument("--n-new-tokens", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=1)
@@ -113,9 +115,12 @@ def main():
 
     model_path = args.model_path or snapshot_download(args.model_id)
     dtype = torch.float32
-    tp_model = TPMambaLM.from_pretrained_shard(model_path, rank=rank, world_size=world_size, dtype=dtype)
+    tp_model = TPMambaLM.from_pretrained_shard(
+        model_path, rank=rank, world_size=world_size, dtype=dtype, allreduce_dtype=args.allreduce_dtype
+    )
     tp_model = tp_model.to(args.device).eval()
-    log(rank, f"loaded TP shard on {args.device}:{local_rank}, world_size={world_size}")
+    log(rank, f"loaded TP shard on {args.device}:{local_rank}, world_size={world_size}, "
+              f"allreduce_dtype={args.allreduce_dtype}")
 
     results = {}
     for L in args.prompt_lens:
