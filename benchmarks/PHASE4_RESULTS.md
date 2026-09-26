@@ -62,3 +62,50 @@ torchrun --standalone --nproc_per_node=2 scripts/run_tp.py \
 
 Compare each `prefill_tokens_per_s` / `tokens_per_s_decode` against the
 matching `--allreduce-dtype fp32` run from Phase 3 to get the speedup.
+
+## Real GPU results (Kaggle 2xT4, mamba-130m, FP16 AllReduce)
+
+**Methodology note first:** a naive cross-session comparison (fp32 numbers
+from one Kaggle notebook session, fp16 from a separate later session)
+initially looked dramatic in both directions -- decode looked ~28% slower
+and the single-GPU *dense* baseline (which fp16-AllReduce can't possibly
+affect) also swung by >20% between sessions. That's shared-infra variance
+(thermal throttling / other tenants / clock state), not our code, and it's
+large enough to swamp a real effect if you're not careful. All numbers below
+are same-session, back-to-back runs on identical hardware state -- the only
+way to trust a comparison here.
+
+| workload | fp32 | fp16 | change |
+|---|---|---|---|
+| decode, len=64  | 32.5 tok/s | 28.5 tok/s | **-12%** |
+| decode, len=256 | 33.3 tok/s | 30.1 tok/s | **-9%**  |
+| decode, len=1024| 33.1 tok/s | 27.7 tok/s | **-16%** |
+| prefill, batch=32, len=1024 | 2526 tok/s | 2675 tok/s | **+6%** |
+
+**Decode gets consistently worse with fp16 AllReduce, across every prompt
+length tested.** This is sharper than the Phase 3 prediction of "no
+benefit" -- it's an active regression. Cause: `all_reduce_sum_fp16` adds two
+extra elementwise cast kernels per call (fp32->fp16 before, fp16->fp32
+after). Decode's payload is already tiny (latency-bound, nothing to save by
+halving a few KB), so those two extra kernel launches are pure added
+overhead on top of an already kernel-launch-dominated workload (Phase 3's
+profiler: ~19% of decode's CPU time is just `cudaLaunchKernel`). **Lesson:
+quantizing a latency-bound collective can cost more than it saves** -- a
+real reason production systems don't blindly quantize every AllReduce.
+
+**Prefill at the batch=32/long-prompt crossover point gets a modest but
+real +6%.** Smaller than the ~1.7-1.8x envelope Phase 3's raw payload-size
+math suggested, most likely because this session's overall GPU throughput
+was running ~2.5x slower than the original Phase 3 session (2526-2675 tok/s
+here vs. 6490 tok/s for the identical fp32 config, originally) -- with
+everything slower, the AllReduce itself is a smaller share of total time,
+so there's proportionally less for quantization to save. The direction is
+still right and still consistent with the bandwidth-vs-latency framing:
+fp16 helps exactly where Phase 3 said the collective becomes bandwidth-
+relevant, and hurts exactly where Phase 3 said it's latency-bound.
+
+**int8 was not benchmarked for speed on GPU** -- given the accuracy table
+above (2.4% Top-5 ordered match after 24 layers), the accuracy cost is
+severe enough that a speed number alone wouldn't make it a reasonable
+choice for this model at this depth without a smarter scheme (per-channel
+scales, error feedback, or quantizing only a subset of layers/collectives).

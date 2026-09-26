@@ -107,3 +107,19 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   floor for FP16 (should be near-lossless) and diagnostic-only reporting for
   INT8 (how lossy it ends up is the finding, not an assumption to encode as
   a pass/fail threshold).
+
+- **GPU follow-up (Kaggle 2xT4, same-session controlled runs -- see
+  `benchmarks/PHASE4_RESULTS.md`):** FP16 AllReduce makes decode
+  consistently *worse* (-9% to -16% across prompt lengths 64/256/1024) --
+  sharper than predicted; the two extra cast kernels per call are pure
+  overhead when the payload is already tiny and latency-bound. FP16
+  AllReduce gives a modest but real +6% on the batch=32/len=1024 prefill
+  case, the bandwidth-relevant regime Phase 3 identified -- direction
+  confirmed, magnitude smaller than the raw payload-size math suggested.
+- **Unexpected (methodology):** an initial cross-session comparison (fp32
+  numbers from one Kaggle notebook session, fp16 from a later one) showed
+  a much bigger swing in both directions -- and so did the single-GPU dense
+  baseline, which quantization cannot possibly touch. That is shared-infra
+  variance (thermal/tenant/clock state), not a code effect, and it can be
+  as large as the thing being measured. Fixed by re-running fp32 and fp16
+  back-to-back in the same notebook session before trusting any comparison.
