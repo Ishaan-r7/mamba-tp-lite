@@ -63,7 +63,9 @@ def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-path", default=None)
+    ap.add_argument("--model-path", default=None, help="local HF snapshot dir; overrides --model-id if set")
+    ap.add_argument("--model-id", default="state-spaces/mamba-130m-hf",
+                     help="HF hub id to download, e.g. state-spaces/mamba-1.4b-hf")
     ap.add_argument("--backend", default="nccl", choices=["nccl", "gloo"])
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--prompt-lens", type=int, nargs="+", default=[16, 64, 256])
@@ -83,7 +85,7 @@ def main():
         torch.cuda.set_device(local_rank)
     dist.init_process_group(backend=args.backend, rank=rank, world_size=world_size)
 
-    model_path = args.model_path or snapshot_download("state-spaces/mamba-130m-hf")
+    model_path = args.model_path or snapshot_download(args.model_id)
     dtype = torch.float32
     tp_model = TPMambaLM.from_pretrained_shard(model_path, rank=rank, world_size=world_size, dtype=dtype)
     tp_model = tp_model.to(args.device).eval()
