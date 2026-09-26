@@ -31,17 +31,21 @@ the "packed parameter" fix from Section IV-C: only the channel-sharded ∆
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .model import MambaConfig, MambaMixer
+from .model import LayerCache, MambaConfig, MambaMixer
 from .tp_utils import CommCounter, all_reduce_sum, channel_slice
 
 
 class _TPMambaMixerBase(nn.Module):
-    """Shared structure/forward for the correct and naive variants; they only
-    differ in how `load_shard_from_dense` slices in_proj."""
+    """Shared structure/prefill/step for the correct and naive variants; they
+    only differ in how `load_shard_from_dense` slices in_proj. Each rank's
+    cache (LayerCache) is naturally sharded: conv_state/ssm_state only ever
+    hold this rank's channel-shard, since they're built from local tensors."""
 
     def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None):
         super().__init__()
@@ -66,7 +70,13 @@ class _TPMambaMixerBase(nn.Module):
         self.out_bias = nn.Parameter(torch.zeros(cfg.d_model)) if cfg.bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [batch, seq_len, d_model], identical (replicated) on every rank."""
+        """Convenience wrapper for the mixer-only tests: full sequence, no cache."""
+        out, _, _ = self.prefill(x, cache=None)
+        return out
+
+    def prefill(self, x: torch.Tensor, cache: LayerCache | None = None):
+        """x: [batch, seq_len, d_model], identical (replicated) on every rank.
+        Returns (out [b,l,d_model], conv_state [b,shard,d_conv-1], ssm_state [b,shard,d_state])."""
         b, l, _ = x.shape
         shard, d_state, dt_rank, d_conv = self.shard, self.cfg.d_state, self.cfg.dt_rank, self.cfg.d_conv
 
@@ -74,9 +84,15 @@ class _TPMambaMixerBase(nn.Module):
         x_ssm, z = xz.chunk(2, dim=-1)  # each [b, l, shard]
         x_ssm = x_ssm.transpose(1, 2)  # [b, shard, l]
 
-        x_padded = F.pad(x_ssm, (d_conv - 1, 0))
+        if cache is not None and cache.conv_state is not None:
+            x_padded = torch.cat([cache.conv_state, x_ssm], dim=-1)
+        else:
+            x_padded = F.pad(x_ssm, (d_conv - 1, 0))
         conv_out = F.conv1d(x_padded, self.conv1d.weight, self.conv1d.bias, groups=shard)[..., :l]
         x_ssm = F.silu(conv_out)  # [b, shard, l]
+        final_conv_state = x_padded[..., -(d_conv - 1):].clone() if d_conv > 1 else torch.zeros(
+            b, shard, 0, device=x.device, dtype=x.dtype
+        )
 
         # partial sum over this rank's channel-shard of d_inner -> needs AllReduce to be correct
         x_dbl_partial = self.x_proj(x_ssm.transpose(1, 2))  # [b, l, dt_rank+2*d_state]
@@ -91,7 +107,11 @@ class _TPMambaMixerBase(nn.Module):
         dB = dt[..., None] * B[:, None, :, :]  # [b, shard, l, d_state]
         dBx = dB * x_ssm[..., None]
 
-        ssm_state = torch.zeros(b, shard, d_state, device=x.device, dtype=torch.float32)
+        ssm_state = (
+            cache.ssm_state.float()
+            if cache is not None
+            else torch.zeros(b, shard, d_state, device=x.device, dtype=torch.float32)
+        )
         ys = []
         for t in range(l):
             ssm_state = dA[:, :, t] * ssm_state + dBx[:, :, t]
@@ -101,6 +121,47 @@ class _TPMambaMixerBase(nn.Module):
         y = y * F.silu(z)
 
         out_partial = self.out_proj(y)  # [b, l, d_model], partial sum over this rank's channels
+        out = all_reduce_sum(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
+        if self.out_bias is not None:
+            out = out + self.out_bias
+        return out, final_conv_state, ssm_state.to(x.dtype)
+
+    def step(self, x_t: torch.Tensor, cache: LayerCache):
+        """x_t: [batch, d_model] single token. Mutates cache in place (this
+        rank's channel-shard only). Returns out: [batch, d_model]."""
+        shard, d_state, dt_rank, d_conv = self.shard, self.cfg.d_state, self.cfg.dt_rank, self.cfg.d_conv
+
+        xz = self.in_proj(x_t)
+        x_ssm, z = xz.chunk(2, dim=-1)  # [b, shard] each
+
+        if d_conv > 1:
+            conv_in = torch.cat([cache.conv_state, x_ssm.unsqueeze(-1)], dim=-1)  # [b, shard, d_conv]
+            w = self.conv1d.weight.squeeze(1)  # [shard, d_conv]
+            conv_out = (conv_in * w[None]).sum(dim=-1)
+            if self.conv1d.bias is not None:
+                conv_out = conv_out + self.conv1d.bias
+            cache.conv_state = conv_in[..., 1:].clone()
+        else:
+            conv_out = x_ssm
+        x_ssm = F.silu(conv_out)  # [b, shard]
+
+        x_dbl_partial = self.x_proj(x_ssm)  # [b, dt_rank+2*d_state]
+        x_dbl = all_reduce_sum(x_dbl_partial.contiguous(), self.group, self.comm)  # AllReduce #1
+        dt, B, C = torch.split(x_dbl, [dt_rank, d_state, d_state], dim=-1)
+        dt = F.linear(dt, self.dt_proj.weight, self.dt_proj.bias)  # [b, shard]
+        dt = F.softplus(dt)
+
+        A = -torch.exp(self.A_log.float())  # [shard, d_state]
+        dA = torch.exp(dt[..., None] * A[None])  # [b, shard, d_state]
+        dB = dt[..., None] * B[:, None, :]  # [b, shard, d_state]
+        dBx = dB * x_ssm[..., None]
+
+        cache.ssm_state = (cache.ssm_state.float() * dA + dBx).to(cache.ssm_state.dtype)
+        y = torch.einsum("bdn,bn->bd", cache.ssm_state.float(), C)  # [b, shard]
+        y = y + x_ssm * self.D
+        y = y * F.silu(z)
+
+        out_partial = self.out_proj(y)  # [b, d_model]
         out = all_reduce_sum(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
         if self.out_bias is not None:
             out = out + self.out_bias
@@ -170,3 +231,132 @@ class NaiveTPMambaMixer(_TPMambaMixerBase):
         self.out_proj.weight.data.copy_(dense.out_proj.weight[:, sl])
         if self.out_bias is not None:
             self.out_bias.data.copy_(dense.out_proj.bias if r == 0 else torch.zeros_like(dense.out_proj.bias))
+
+
+class TPMambaBlock(nn.Module):
+    def __init__(self, cfg: MambaConfig, layer_idx: int, rank: int, world_size: int, group=None):
+        super().__init__()
+        self.norm = _import_rmsnorm(cfg)
+        self.mixer = TPMambaMixer(cfg, rank, world_size, group)
+
+    def prefill(self, x, cache: LayerCache | None):
+        residual = x
+        y, conv_state, ssm_state = self.mixer.prefill(self.norm(x), cache)
+        return residual + y, conv_state, ssm_state
+
+    def step(self, x_t, cache: LayerCache):
+        residual = x_t
+        y = self.mixer.step(self.norm(x_t), cache)
+        return residual + y
+
+
+def _import_rmsnorm(cfg: MambaConfig):
+    from .model import RMSNorm
+
+    return RMSNorm(cfg.d_model, eps=cfg.layer_norm_epsilon)
+
+
+class TPMambaLM(nn.Module):
+    """
+    Tensor-parallel full model. Only the mixer is sharded (matching the
+    paper's scope); the embedding/lm_head are small relative to the mixer
+    stack and are simply replicated on every rank, no vocab-parallelism.
+
+    Build with `TPMambaLM.from_pretrained_shard(...)`, which reads the
+    checkpoint's state dict directly and slices each tensor into this rank's
+    shard *before* copying it into a parameter — it never materializes a
+    full dense model in this process, so memory scales down with world_size
+    (the actual point of TP), not just compute.
+    """
+
+    def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None):
+        super().__init__()
+        self.cfg = cfg
+        self.rank = rank
+        self.world_size = world_size
+        self.group = group
+        self.embedding = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.layers = nn.ModuleList(
+            [TPMambaBlock(cfg, i, rank, world_size, group) for i in range(cfg.n_layer)]
+        )
+        self.norm_f = _import_rmsnorm(cfg)
+
+    def lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.embedding.weight)
+
+    def prefill(self, input_ids: torch.Tensor, cache=None):
+        from .model import MambaCache
+
+        x = self.embedding(input_ids)
+        new_layers = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = cache.layers[i] if cache is not None else None
+            x, conv_state, ssm_state = layer.prefill(x, layer_cache)
+            new_layers.append(LayerCache(conv_state=conv_state, ssm_state=ssm_state))
+        x = self.norm_f(x)
+        return self.lm_head(x), MambaCache(new_layers)
+
+    def step(self, input_ids: torch.Tensor, cache):
+        x = self.embedding(input_ids).squeeze(1)
+        for i, layer in enumerate(self.layers):
+            x = layer.step(x, cache.layers[i])
+        x = self.norm_f(x)
+        return self.lm_head(x).unsqueeze(1)
+
+    @torch.no_grad()
+    def generate(self, input_ids: torch.Tensor, max_new_tokens: int):
+        logits, cache = self.prefill(input_ids)
+        next_id = logits[:, -1:].argmax(dim=-1)
+        tokens = [input_ids, next_id]
+        for _ in range(max_new_tokens - 1):
+            logits = self.step(next_id, cache)
+            next_id = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            tokens.append(next_id)
+        return torch.cat(tokens, dim=1)
+
+    @classmethod
+    def from_pretrained_shard(
+        cls, hf_path: str, rank: int, world_size: int, group=None, dtype=torch.float32
+    ) -> "TPMambaLM":
+        """Loads a HF `state-spaces/mamba-*-hf` checkpoint, keeping in memory
+        (per rank) only this rank's channel-shard of every mixer tensor."""
+        from safetensors.torch import load_file
+
+        cfg = MambaConfig.from_hf_config(f"{hf_path}/config.json")
+        model = cls(cfg, rank, world_size, group).to(dtype)
+        sd = load_file(f"{hf_path}/model.safetensors")
+
+        model.embedding.weight.data.copy_(sd["backbone.embeddings.weight"].to(dtype))
+        model.norm_f.weight.data.copy_(sd["backbone.norm_f.weight"].to(dtype))
+
+        sl = channel_slice(rank, world_size, cfg.d_inner)
+        d_inner = cfg.d_inner
+        for i in range(cfg.n_layer):
+            p = f"backbone.layers.{i}."
+            block = model.layers[i]
+            block.norm.weight.data.copy_(sd[p + "norm.weight"].to(dtype))
+            mixer = block.mixer
+
+            w = sd[p + "mixer.in_proj.weight"]
+            x_rows, z_rows = w[:d_inner][sl], w[d_inner:][sl]
+            mixer.in_proj.weight.data.copy_(torch.cat([x_rows, z_rows], dim=0).to(dtype))
+            if cfg.bias:
+                b = sd[p + "mixer.in_proj.bias"]
+                bx, bz = b[:d_inner][sl], b[d_inner:][sl]
+                mixer.in_proj.bias.data.copy_(torch.cat([bx, bz], dim=0).to(dtype))
+
+            mixer.conv1d.weight.data.copy_(sd[p + "mixer.conv1d.weight"][sl].to(dtype))
+            if cfg.conv_bias:
+                mixer.conv1d.bias.data.copy_(sd[p + "mixer.conv1d.bias"][sl].to(dtype))
+
+            mixer.x_proj.weight.data.copy_(sd[p + "mixer.x_proj.weight"][:, sl].to(dtype))
+            mixer.dt_proj.weight.data.copy_(sd[p + "mixer.dt_proj.weight"][sl].to(dtype))
+            mixer.dt_proj.bias.data.copy_(sd[p + "mixer.dt_proj.bias"][sl].to(dtype))
+            mixer.A_log.data.copy_(sd[p + "mixer.A_log"][sl].to(dtype))
+            mixer.D.data.copy_(sd[p + "mixer.D"][sl].to(dtype))
+            mixer.out_proj.weight.data.copy_(sd[p + "mixer.out_proj.weight"][:, sl].to(dtype))
+            if cfg.bias and mixer.out_bias is not None:
+                ob = sd[p + "mixer.out_proj.bias"]
+                mixer.out_bias.data.copy_(ob.to(dtype) if rank == 0 else torch.zeros_like(ob, dtype=dtype))
+
+        return model
