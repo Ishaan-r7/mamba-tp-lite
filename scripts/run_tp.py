@@ -67,6 +67,7 @@ def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1, 
       "captured"  -- requested and successfully captured; decode used replay()
       "fallback:<reason>" -- requested but capture failed, fell back to eager
     so results are always labeled with what actually ran, not just what was asked for."""
+    torch.manual_seed(1234)  # fixed seed: makes eager vs graphed calls directly comparable (same prompt)
     ids = torch.randint(0, model.cfg.vocab_size, (batch_size, prompt_len), device=device)
     cuda_graph_status = "off"
 
@@ -106,6 +107,39 @@ def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1, 
     }
 
 
+def verify_cuda_graph_correctness(model, prompt_len, device, batch_size=1, n_steps=5):
+    """A fast speedup number is worthless if the graph silently computes the
+    wrong thing. Runs the SAME prompt through two independent caches -- one
+    stepped eagerly, one via captured graph replay -- and checks every
+    step's logits match closely. Returns (ok: bool | None, max_abs_diff:
+    float | str) -- ok=None means graph capture itself wasn't supported here
+    (e.g. no CUDA), which is a different outcome from a numerical mismatch."""
+    torch.manual_seed(1234)
+    ids = torch.randint(0, model.cfg.vocab_size, (batch_size, prompt_len), device=device)
+    next_id = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        _, cache_eager = model.prefill(ids)
+        eager_logits = [model.step(next_id, cache_eager).clone() for _ in range(n_steps)]
+
+        _, cache_graph = model.prefill(ids)  # independent cache, same prompt
+        try:
+            stepper = GraphedStepper(model, cache_graph, batch_size, device)
+            stepper.capture()
+        except CUDAGraphUnsupported as e:
+            return None, f"capture unsupported: {e}"
+        graph_logits = [stepper.replay(next_id).clone() for _ in range(n_steps)]
+
+    max_diff = 0.0
+    ok = True
+    for i, (e, g) in enumerate(zip(eager_logits, graph_logits)):
+        diff = (e - g).abs().max().item()
+        max_diff = max(max_diff, diff)
+        if not torch.allclose(e, g, atol=1e-3, rtol=1e-3):
+            ok = False
+    return ok, max_diff
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default=None, help="local HF snapshot dir; overrides --model-id if set")
@@ -129,7 +163,15 @@ def main():
     ap.add_argument("--cuda-graph", action="store_true",
                      help="Phase 5: capture the decode step as a CUDA graph (requires --device cuda; "
                           "not compatible with --allreduce-dtype int8, which needs a GPU->CPU sync)")
+    ap.add_argument("--compare-cuda-graph", action="store_true",
+                     help="run both eager and graphed decode back-to-back in this same process, "
+                          "for a same-session apples-to-apples speedup number (implies --cuda-graph)")
+    ap.add_argument("--verify-cuda-graph", action="store_true",
+                     help="numerically check graphed decode matches eager decode (same prompt, "
+                          "independent caches) before trusting any speedup number")
     args = ap.parse_args()
+    if args.compare_cuda_graph:
+        args.cuda_graph = True
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -148,16 +190,32 @@ def main():
     log(rank, f"loaded TP shard on {args.device}:{local_rank}, world_size={world_size}, "
               f"allreduce_dtype={args.allreduce_dtype}")
 
+    if args.verify_cuda_graph:
+        ok, max_diff = verify_cuda_graph_correctness(tp_model, args.prompt_lens[0], args.device, args.batch_size)
+        log(rank, f"[TP cuda-graph correctness] match={ok} detail={max_diff}")
+
     results = {}
     for L in args.prompt_lens:
-        # warmup (build kernels / cuDNN autotune / first-touch memory)
-        bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
-        stats = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
-        comm = tp_model.layers[0].mixer.comm
-        stats["allreduces_per_layer0"] = comm.count
-        comm.reset()
-        results[L] = stats
-        log(rank, f"prompt_len={L}: {stats}")
+        if args.compare_cuda_graph:
+            bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size, False)
+            eager = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size, False)
+            bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size, True)
+            graphed = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size, True)
+            comm = tp_model.layers[0].mixer.comm
+            comm.reset()
+            speedup = graphed["tokens_per_s_decode"] / eager["tokens_per_s_decode"]
+            results[L] = {"eager": eager, "graphed": graphed, "graph_speedup": speedup}
+            log(rank, f"prompt_len={L} EAGER:   {eager}")
+            log(rank, f"prompt_len={L} GRAPHED: {graphed}  (speedup={speedup:.2f}x)")
+        else:
+            # warmup (build kernels / cuDNN autotune / first-touch memory)
+            bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
+            stats = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
+            comm = tp_model.layers[0].mixer.comm
+            stats["allreduces_per_layer0"] = comm.count
+            comm.reset()
+            results[L] = stats
+            log(rank, f"prompt_len={L}: {stats}")
 
     if args.prefill_throughput:
         results["prefill_throughput"] = {}
@@ -171,11 +229,24 @@ def main():
     if args.compare_single_gpu and rank == 0:
         dense = MambaLM.from_pretrained(model_path, dtype=dtype).to(args.device).eval()
         log(rank, "-- single-GPU (no TP) comparison, rank 0 only --")
+        if args.verify_cuda_graph:
+            ok, max_diff = verify_cuda_graph_correctness(dense, args.prompt_lens[0], args.device, args.batch_size)
+            log(rank, f"[1-GPU cuda-graph correctness] match={ok} detail={max_diff}")
         for L in args.prompt_lens:
-            bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
-            stats = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
-            log(rank, f"[1-GPU dense] prompt_len={L}: {stats}")
-            results.setdefault("single_gpu", {})[L] = stats
+            if args.compare_cuda_graph:
+                bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size, False)
+                eager = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size, False)
+                bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size, True)
+                graphed = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size, True)
+                speedup = graphed["tokens_per_s_decode"] / eager["tokens_per_s_decode"]
+                results.setdefault("single_gpu", {})[L] = {"eager": eager, "graphed": graphed, "graph_speedup": speedup}
+                log(rank, f"[1-GPU dense] prompt_len={L} EAGER:   {eager}")
+                log(rank, f"[1-GPU dense] prompt_len={L} GRAPHED: {graphed}  (speedup={speedup:.2f}x)")
+            else:
+                bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
+                stats = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
+                log(rank, f"[1-GPU dense] prompt_len={L}: {stats}")
+                results.setdefault("single_gpu", {})[L] = stats
 
         if args.prefill_throughput:
             for L in args.prompt_lens:
