@@ -143,7 +143,10 @@ class _TPMambaMixerBase(nn.Module):
             conv_out = (conv_in * w[None]).sum(dim=-1)
             if self.conv1d.bias is not None:
                 conv_out = conv_out + self.conv1d.bias
-            cache.conv_state = conv_in[..., 1:].clone()
+            # in-place: CUDA graph replay reads/writes fixed addresses, so the
+            # cache tensor's identity must stay the same across steps, not be
+            # replaced by a new tensor object each call (see cuda_graph.py)
+            cache.conv_state.copy_(conv_in[..., 1:])
         else:
             conv_out = x_ssm
         x_ssm = F.silu(conv_out)  # [b, shard]
@@ -159,7 +162,7 @@ class _TPMambaMixerBase(nn.Module):
         dB = dt[..., None] * B[:, None, :]  # [b, shard, d_state]
         dBx = dB * x_ssm[..., None]
 
-        cache.ssm_state = (cache.ssm_state.float() * dA + dBx).to(cache.ssm_state.dtype)
+        cache.ssm_state.copy_((cache.ssm_state.float() * dA + dBx).to(cache.ssm_state.dtype))
         y = torch.einsum("bdn,bn->bd", cache.ssm_state.float(), C)  # [b, shard]
         y = y + x_ssm * self.D
         y = y * F.silu(z)
