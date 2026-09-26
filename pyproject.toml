@@ -1,0 +1,12 @@
+[project]
+name = "mamba-tp-lite"
+version = "0.1.0"
+description = "From-scratch Mamba + tensor-parallel inference, built for learning (SSM cache, TP sharding, quantized AllReduce)."
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["mamba_lite"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
