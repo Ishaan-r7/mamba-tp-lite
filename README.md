@@ -17,6 +17,7 @@ inference and tensor-parallel systems design, not a reproduction. See
 | 2 | [`mamba_lite/tp_model.py`](mamba_lite/tp_model.py) | Tensor-parallel mixer: channel-sharded, exactly 2 AllReduces/block. Includes a deliberately broken `NaiveTPMambaMixer` for comparison. |
 | 3 | [`scripts/run_tp.py`](scripts/run_tp.py) | `torchrun`-launched benchmark/profiler: TP vs single-GPU throughput, `torch.profiler` traces. |
 | 4 | [`mamba_lite/tp_utils.py`](mamba_lite/tp_utils.py) | Quantized AllReduce (FP16, INT8) + a paper-Table-I-style accuracy check. |
+| 5 | [`mamba_lite/cuda_graph.py`](mamba_lite/cuda_graph.py) | CUDA graph capture for decode, with a numerical correctness check built before trusting any speedup number. |
 
 ## Results
 
@@ -40,7 +41,11 @@ inference and tensor-parallel systems design, not a reproduction. See
 
 <img src="assets/phase4_fp16_speed_change.png" width="500">
 
-Full numbers and analysis: [`benchmarks/PHASE3_RESULTS.md`](benchmarks/PHASE3_RESULTS.md), [`benchmarks/PHASE4_RESULTS.md`](benchmarks/PHASE4_RESULTS.md). Regenerate these charts with `.venv/bin/python scripts/make_plots.py`.
+**Phase 5 — CUDA graphs cut decode's per-op launch overhead, ~2.5-3.7x faster, verified bit-exact correct (not just faster):**
+
+<img src="assets/phase5_cuda_graph_speedup.png" width="700">
+
+Full numbers and analysis: [`benchmarks/PHASE3_RESULTS.md`](benchmarks/PHASE3_RESULTS.md), [`benchmarks/PHASE4_RESULTS.md`](benchmarks/PHASE4_RESULTS.md), [`benchmarks/PHASE5_RESULTS.md`](benchmarks/PHASE5_RESULTS.md) (including two real bugs found and fixed along the way — a correctness check that gets built *before* trusting a speedup number is worth the trouble it causes). Regenerate these charts with `.venv/bin/python scripts/make_plots.py`.
 
 ## Setup
 
@@ -71,4 +76,8 @@ python3 -m venv .venv
 torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend gloo --device cpu   # local smoke test
 torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend nccl --device cuda \
   --compare-single-gpu --profile --allreduce-dtype fp16   # on a real 2-GPU box (e.g. Kaggle "GPU T4 x2")
+
+# Phase 5: CUDA graph decode speedup, verified correct, same-session A/B (real GPU only, no CPU fallback)
+torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend nccl --device cuda \
+  --compare-single-gpu --verify-cuda-graph --compare-cuda-graph
 ```
