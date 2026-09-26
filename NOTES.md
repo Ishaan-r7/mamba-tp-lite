@@ -123,3 +123,52 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   variance (thermal/tenant/clock state), not a code effect, and it can be
   as large as the thing being measured. Fixed by re-running fp32 and fp16
   back-to-back in the same notebook session before trusting any comparison.
+
+## Phase 5 — CUDA graphs for decode
+
+- **Goal:** decode was found (Phase 3) to be dominated by per-op kernel-launch
+  overhead, not compute -- CUDA graphs capture the whole decode step's
+  kernel launches once and replay them as a single launch, testing that
+  hypothesis directly. Unlike every earlier phase, this needs a real GPU:
+  no CPU/gloo fallback exists for CUDA graphs.
+- **Action:** `mamba_lite/cuda_graph.py`'s `GraphedStepper` (warmup on a side
+  stream, capture, replay -- both for the dense model and the TP+NCCL path),
+  wired into `scripts/run_tp.py` via `--cuda-graph`, plus
+  `--verify-cuda-graph` (numerical correctness check) and
+  `--compare-cuda-graph` (same-session eager-vs-graphed A/B).
+- **Result:** verified correct (`match=True, detail=0.0` -- exact, not just
+  close) and a consistent **~2.5-3.7x decode speedup**, both TP and
+  single-GPU, across all three prompt lengths tested. Confirms Phase 3's
+  launch-overhead hypothesis directly. Full numbers in
+  `benchmarks/PHASE5_RESULTS.md`.
+- **Unexpected -- two real bugs, caught specifically because a correctness
+  check was built before trusting any speed number:**
+  1. Warmup calls ran against the *real* cache before capture, and `step()`
+     isn't idempotent under a repeated input -- it silently advanced the
+     cache 3 real steps before anything was even captured.
+  2. The actual root cause: `step()` updated cache state via Python
+     reassignment (`cache.ssm_state = new_tensor`) instead of writing into
+     the existing tensor in place. CUDA graph replay never re-runs Python --
+     it only replays recorded kernel launches against the exact memory
+     addresses seen during the one capture call -- so the captured graph
+     permanently read from the pre-capture address and wrote to a different
+     one every time. **The graph never actually advanced the recurrence at
+     all**; every replay silently recomputed "step 1 from the original
+     state," forever. This would have shipped a model that produces wrong
+     text while reporting an exciting (and honestly still directionally
+     correct, since kernel-launch cost doesn't depend on tensor values)
+     speedup number.
+  3. Fixing bug #1 alone made the measured mismatch *larger* (33.4 -> 182.2
+     max abs logit diff), which was the tell that #1 wasn't the real cause
+     -- a genuine but secondary bug partially masking a bigger one.
+- **Fix:** `_clone_cache()` for warmup (bug #1); `.copy_()` instead of
+  reassignment for cache updates in both `mamba_lite/model.py` and
+  `mamba_lite/tp_model.py` (bug #2, the real fix). Both changes are
+  value-preserving for eager execution -- confirmed by the full existing
+  test suite (9/9) passing unchanged after each fix.
+- **Contribution:** this is the clearest example in the whole project of why
+  a fast number and a correct number are different claims that both need
+  checking, not just one. The verification harness (`verify_cuda_graph_correctness`)
+  was built *before* trusting the first "captured, 2-3x faster" result, and
+  it caught a bug that a napkin-math sanity check ("the number looks
+  plausible") would never have surfaced.

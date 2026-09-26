@@ -147,4 +147,29 @@ for b, v in zip(bars, pct_change):
                 ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
 savefig(fig, "phase4_fp16_speed_change.png")
 
+# ---------------------------------------------------------------------------
+# 6. Phase 5: CUDA graph decode speedup, verified correct (same-session)
+# ---------------------------------------------------------------------------
+prompt_lens_labels = ["64", "256", "1024"]
+tp_eager = [37.8, 36.3, 37.6]
+tp_graphed = [112.5, 133.0, 122.6]
+gpu1_eager = [55.3, 55.3, 52.2]
+gpu1_graphed = [175.2, 137.0, 145.3]
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=False)
+for ax, eager, graphed, title in zip(axes, [tp_eager, gpu1_eager], [tp_graphed, gpu1_graphed], ["TP (2xT4)", "1 GPU (no TP)"]):
+    x = np.arange(len(prompt_lens_labels))
+    ax.bar(x - w / 2, eager, w, label="eager", color=COLOR_1GPU)
+    ax.bar(x + w / 2, graphed, w, label="CUDA graph", color=COLOR_CACHED)
+    for xi, e, g in zip(x, eager, graphed):
+        ax.annotate(f"{g/e:.2f}x", (xi, g), ha="center", va="bottom", fontsize=10, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(prompt_lens_labels)
+    ax.set_xlabel("prompt length (tokens)")
+    ax.set_title(title)
+    ax.legend()
+axes[0].set_ylabel("decode tokens / sec")
+fig.suptitle("Phase 5: CUDA graphs speed up decode ~2.5-3.7x\n(verified bit-exact correct, not just faster)", y=1.06, fontweight="bold")
+savefig(fig, "phase5_cuda_graph_speedup.png")
+
 print("done")

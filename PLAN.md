@@ -71,9 +71,42 @@ Measure: speedup vs unquantized TP, and accuracy vs unquantized: Top-1 agreement
 
 Learn: bytes-on-the-wire vs latency, the alpha-beta cost model, why tiny collectives don't benefit.
 
-## Stretch ideas
+## Phase 5 — CUDA graphs for decode
 
-- CUDA Graphs for the decode step (kills kernel-launch overhead at batch 1).
+Build: capture the whole `model.step()` call (all layers, all ops, and for
+TP all 2*n_layer AllReduces) once as a CUDA graph, then replay it per token
+instead of re-launching every kernel from Python each time. Standard
+warmup-on-a-side-stream -> capture -> replay recipe
+(`mamba_lite/cuda_graph.py`). No CPU/gloo fallback exists for this --
+everything needs a real GPU, unlike every earlier phase.
+
+Two parts, different risk:
+- Dense (single-GPU) graphed decode: no NCCL involved, low risk, should
+  cleanly show a speedup if decode really is kernel-launch-bound like
+  Phase 3's profiler suggested.
+- TP graphed decode: capturing `dist.all_reduce` inside a CUDA graph is a
+  genuinely finicky, version-sensitive PyTorch/NCCL interaction. Wrapped
+  defensively (`CUDAGraphUnsupported`) so a capture failure falls back to
+  eager decode with a clear message instead of crashing.
+
+Also: int8 quantized AllReduce (Phase 4) calls `.item()` to sync its scale,
+which is a GPU->CPU sync and cannot be captured -- explicitly rejected
+rather than silently miscaptured.
+
+Measure: decode ms/token, graphed vs eager, for both the dense model and
+TP. If it works, also worth re-checking whether fp16 AllReduce's earlier
+decode regression (Phase 4: -9% to -16%) survives once kernel-launch
+overhead is captured away.
+
+Learn: CUDA graph capture semantics (why replay works via fixed memory
+addresses regardless of Python-level variable reassignment), the difference
+between "reduces work" and "reduces launch overhead" optimizations, and
+where NCCL-in-graph-capture support is and isn't solid in practice.
+
+## Other stretch ideas (not started)
+
 - Write the selective-scan decode step as a Triton kernel.
 - Swap in `mamba-ssm` fused kernels and see what changes.
 - Batched serving loop with requests of different lengths.
+- A simple heuristic that auto-picks AllReduce precision from measured
+  payload size (grounded in Phase 4's actual crossover, not a guess).
