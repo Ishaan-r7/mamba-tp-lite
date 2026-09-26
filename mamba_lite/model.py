@@ -145,6 +145,18 @@ class MambaMixer(nn.Module):
         self.A_log = nn.Parameter(torch.empty(d_inner, d_state))
         self.D = nn.Parameter(torch.empty(d_inner))
         self.out_proj = nn.Linear(d_inner, d_model, bias=cfg.bias)
+        self._reset_ssm_params()
+
+    def _reset_ssm_params(self):
+        """A_log/D are plain nn.Parameter(torch.empty(...)) so, unlike in_proj/x_proj/etc,
+        they get no default init from nn.Linear/nn.Conv1d. from_pretrained() overwrites
+        these anyway, but a freshly-constructed MambaMixer (e.g. in the TP tests) needs
+        them deterministic, not leftover uninitialized memory. Same S4D-real init as HF."""
+        with torch.no_grad():
+            A = torch.arange(1, self.A_log.shape[1] + 1, dtype=torch.float32)[None, :]
+            A = A.expand(self.A_log.shape[0], -1).contiguous()
+            self.A_log.copy_(torch.log(A))
+            self.D.fill_(1.0)
 
     # ---- prefill: full-sequence selective scan (sequential reference form) ----
     def prefill(self, x: torch.Tensor, cache: LayerCache | None = None):
@@ -205,6 +217,11 @@ class MambaMixer(nn.Module):
         out = self.out_proj(y)  # [b, l, d_model]
 
         return out, final_conv_state, ssm_state.to(x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Plain no-cache forward, used as the dense reference in TP correctness tests."""
+        out, _, _ = self.prefill(x, cache=None)
+        return out
 
     # ---- step: single-token recurrent update (decode) ----
     def step(self, x_t: torch.Tensor, cache: LayerCache):
