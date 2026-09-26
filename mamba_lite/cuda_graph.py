@@ -31,6 +31,23 @@ class CUDAGraphUnsupported(RuntimeError):
     and fall back to eager execution rather than crash the whole benchmark."""
 
 
+def _clone_cache(cache):
+    """Deep-copies a MambaCache (used by both MambaLM and TPMambaLM) so
+    warmup can exercise the model's step() -- which mutates cache state on
+    every call, since the recurrence advances regardless of what token value
+    is fed in -- without advancing the REAL cache the caller intends to
+    capture from. Warming up on the real cache silently shifts capture to
+    "step n_warmup+1 onward" instead of "step 1 onward", which any code
+    comparing graphed vs eager output from the same starting cache would
+    (correctly) flag as a mismatch -- this is exactly the bug that
+    `verify_cuda_graph_correctness` caught the first time this shipped."""
+    from .model import LayerCache, MambaCache
+
+    return MambaCache(
+        [LayerCache(conv_state=l.conv_state.clone(), ssm_state=l.ssm_state.clone()) for l in cache.layers]
+    )
+
+
 class GraphedStepper:
     """Captures `model.step(static_ids, cache)` once, then replays it.
 
@@ -68,12 +85,23 @@ class GraphedStepper:
         #    the caching allocator settle on stable addresses before we
         #    record anything. Skipping this is the most common way to get
         #    silently wrong results from a "successful" capture.
+        #
+        #    Warmup runs against a DISPOSABLE CLONE of self.cache, not
+        #    self.cache itself: step() advances the recurrent state on every
+        #    call regardless of the (fixed, dummy) input token, so warming
+        #    up on the real cache would silently advance it n_warmup steps
+        #    before capture ever records anything -- capture would then
+        #    represent "step n_warmup+1 onward", not "step 1 onward" from
+        #    the cache the caller handed us. The clone has identical shapes/
+        #    dtypes/device, so it exercises the same allocator size classes
+        #    just as effectively.
+        warmup_cache = _clone_cache(self.cache)
         side_stream = torch.cuda.Stream()
         side_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side_stream):
             with torch.no_grad():
                 for _ in range(self.n_warmup):
-                    self.model.step(self.static_ids, self.cache)
+                    self.model.step(self.static_ids, warmup_cache)
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
 
