@@ -38,6 +38,28 @@ def sync(device):
         torch.cuda.synchronize()
 
 
+def bench_prefill_throughput(model, batch_size, prompt_len, device, n_repeats=3):
+    """Pure prefill: one big batched forward over the whole prompt, no
+    per-token loop. This is the compute-bound regime (large batched GEMMs +
+    a batched scan) where TP's per-GPU FLOPs actually drop in half, unlike
+    single-token decode where 2 AllReduces x n_layer dominate regardless of
+    batch size. tokens/s here counts every prompt token in the batch."""
+    ids = torch.randint(0, model.cfg.vocab_size, (batch_size, prompt_len), device=device)
+
+    with torch.no_grad():
+        model.prefill(ids)  # warmup: kernel selection / first-touch memory
+        sync(device)
+        t0 = time.perf_counter()
+        for _ in range(n_repeats):
+            model.prefill(ids)
+        sync(device)
+        t1 = time.perf_counter()
+
+    total_tokens = batch_size * prompt_len * n_repeats
+    elapsed = t1 - t0
+    return {"prefill_tokens_per_s": total_tokens / elapsed, "prefill_s_per_call": elapsed / n_repeats}
+
+
 def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1):
     ids = torch.randint(0, model.cfg.vocab_size, (batch_size, prompt_len), device=device)
 
@@ -71,6 +93,10 @@ def main():
     ap.add_argument("--prompt-lens", type=int, nargs="+", default=[16, 64, 256])
     ap.add_argument("--n-new-tokens", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--prefill-throughput", action="store_true",
+                     help="also benchmark pure prefill (compute-bound: big batched GEMMs, no per-token loop)")
+    ap.add_argument("--prefill-batch-sizes", type=int, nargs="+", default=[1, 8, 32],
+                     help="batch sizes to sweep for --prefill-throughput")
     ap.add_argument("--compare-single-gpu", action="store_true",
                      help="rank 0 also times the dense (non-TP) model on its own device, for a TP-vs-1-GPU comparison")
     ap.add_argument("--profile", action="store_true")
@@ -102,6 +128,15 @@ def main():
         results[L] = stats
         log(rank, f"prompt_len={L}: {stats}")
 
+    if args.prefill_throughput:
+        results["prefill_throughput"] = {}
+        for L in args.prompt_lens:
+            for B in args.prefill_batch_sizes:
+                stats = bench_prefill_throughput(tp_model, B, L, args.device)
+                log(rank, f"[TP prefill] batch={B} prompt_len={L}: {stats}")
+                results["prefill_throughput"][f"tp_b{B}_l{L}"] = stats
+
+    dense = None
     if args.compare_single_gpu and rank == 0:
         dense = MambaLM.from_pretrained(model_path, dtype=dtype).to(args.device).eval()
         log(rank, "-- single-GPU (no TP) comparison, rank 0 only --")
@@ -110,6 +145,13 @@ def main():
             stats = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size)
             log(rank, f"[1-GPU dense] prompt_len={L}: {stats}")
             results.setdefault("single_gpu", {})[L] = stats
+
+        if args.prefill_throughput:
+            for L in args.prompt_lens:
+                for B in args.prefill_batch_sizes:
+                    stats = bench_prefill_throughput(dense, B, L, args.device)
+                    log(rank, f"[1-GPU prefill] batch={B} prompt_len={L}: {stats}")
+                    results["prefill_throughput"][f"1gpu_b{B}_l{L}"] = stats
 
     if args.profile:
         os.makedirs(args.profile_dir, exist_ok=True)

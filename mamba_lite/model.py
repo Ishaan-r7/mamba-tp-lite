@@ -25,6 +25,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def load_hf_state_dict(hf_path: str) -> dict[str, torch.Tensor]:
+    """Loads a HF checkpoint's weights, whether it's a single model.safetensors
+    file (e.g. mamba-130m-hf) or sharded across multiple files with a
+    model.safetensors.index.json (e.g. mamba-1.4b-hf, mamba-2.8b-hf)."""
+    import os
+
+    from safetensors.torch import load_file
+
+    single = os.path.join(hf_path, "model.safetensors")
+    index = os.path.join(hf_path, "model.safetensors.index.json")
+    if os.path.exists(single):
+        return load_file(single)
+    if os.path.exists(index):
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+        state_dict = {}
+        for shard_file in sorted(set(weight_map.values())):
+            state_dict.update(load_file(os.path.join(hf_path, shard_file)))
+        return state_dict
+    raise FileNotFoundError(f"no model.safetensors or model.safetensors.index.json under {hf_path}")
+
+
 @dataclass
 class MambaConfig:
     d_model: int
@@ -341,12 +363,11 @@ class MambaLM(nn.Module):
 
     @classmethod
     def from_pretrained(cls, hf_path: str, dtype=torch.float32) -> "MambaLM":
-        """Load weights from a local HF `state-spaces/mamba-*-hf` snapshot directory."""
-        from safetensors.torch import load_file
-
+        """Load weights from a local HF `state-spaces/mamba-*-hf` snapshot directory
+        (single-file or sharded safetensors, see load_hf_state_dict)."""
         cfg = MambaConfig.from_hf_config(f"{hf_path}/config.json")
         model = cls(cfg).to(dtype)
-        state_dict = load_file(f"{hf_path}/model.safetensors")
+        state_dict = load_hf_state_dict(hf_path)
 
         remapped = {}
         remapped["embedding.weight"] = state_dict["backbone.embeddings.weight"]

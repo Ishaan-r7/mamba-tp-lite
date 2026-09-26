@@ -318,13 +318,14 @@ class TPMambaLM(nn.Module):
     def from_pretrained_shard(
         cls, hf_path: str, rank: int, world_size: int, group=None, dtype=torch.float32
     ) -> "TPMambaLM":
-        """Loads a HF `state-spaces/mamba-*-hf` checkpoint, keeping in memory
-        (per rank) only this rank's channel-shard of every mixer tensor."""
-        from safetensors.torch import load_file
+        """Loads a HF `state-spaces/mamba-*-hf` checkpoint (single-file or
+        sharded safetensors), keeping in memory (per rank) only this rank's
+        channel-shard of every mixer tensor."""
+        from .model import load_hf_state_dict
 
         cfg = MambaConfig.from_hf_config(f"{hf_path}/config.json")
         model = cls(cfg, rank, world_size, group).to(dtype)
-        sd = load_file(f"{hf_path}/model.safetensors")
+        sd = load_hf_state_dict(hf_path)
 
         model.embedding.weight.data.copy_(sd["backbone.embeddings.weight"].to(dtype))
         model.norm_f.weight.data.copy_(sd["backbone.norm_f.weight"].to(dtype))
