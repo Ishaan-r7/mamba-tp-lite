@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import snapshot_download
 
+from mamba_lite.cuda_graph import CUDAGraphUnsupported, GraphedStepper
 from mamba_lite.model import MambaLM
 from mamba_lite.tp_model import TPMambaLM
 
@@ -60,8 +61,14 @@ def bench_prefill_throughput(model, batch_size, prompt_len, device, n_repeats=3)
     return {"prefill_tokens_per_s": total_tokens / elapsed, "prefill_s_per_call": elapsed / n_repeats}
 
 
-def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1):
+def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1, use_cuda_graph=False):
+    """cuda_graph_status in the result is one of:
+      "off"       -- not requested
+      "captured"  -- requested and successfully captured; decode used replay()
+      "fallback:<reason>" -- requested but capture failed, fell back to eager
+    so results are always labeled with what actually ran, not just what was asked for."""
     ids = torch.randint(0, model.cfg.vocab_size, (batch_size, prompt_len), device=device)
+    cuda_graph_status = "off"
 
     with torch.no_grad():
         sync(device)
@@ -71,15 +78,31 @@ def bench_prefill_decode(model, prompt_len, n_new_tokens, device, batch_size=1):
         t1 = time.perf_counter()
 
         next_id = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        stepper = None
+        if use_cuda_graph:
+            try:
+                stepper = GraphedStepper(model, cache, batch_size, device)
+                stepper.capture()
+                cuda_graph_status = "captured"
+            except CUDAGraphUnsupported as e:
+                cuda_graph_status = f"fallback:{e}"
+                stepper = None
+
+        sync(device)
+        t1b = time.perf_counter()  # re-mark start of decode timing AFTER capture overhead
         for _ in range(n_new_tokens):
-            model.step(next_id, cache)
+            if stepper is not None:
+                stepper.replay(next_id)
+            else:
+                model.step(next_id, cache)
         sync(device)
         t2 = time.perf_counter()
 
     return {
         "prefill_s": t1 - t0,
-        "decode_ms_per_token": (t2 - t1) / n_new_tokens * 1000,
-        "tokens_per_s_decode": n_new_tokens / (t2 - t1),
+        "decode_ms_per_token": (t2 - t1b) / n_new_tokens * 1000,
+        "tokens_per_s_decode": n_new_tokens / (t2 - t1b),
+        "cuda_graph_status": cuda_graph_status,
     }
 
 
@@ -103,6 +126,9 @@ def main():
                      help="rank 0 also times the dense (non-TP) model on its own device, for a TP-vs-1-GPU comparison")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--profile-dir", default="profiles")
+    ap.add_argument("--cuda-graph", action="store_true",
+                     help="Phase 5: capture the decode step as a CUDA graph (requires --device cuda; "
+                          "not compatible with --allreduce-dtype int8, which needs a GPU->CPU sync)")
     args = ap.parse_args()
 
     rank = int(os.environ["RANK"])
@@ -125,8 +151,8 @@ def main():
     results = {}
     for L in args.prompt_lens:
         # warmup (build kernels / cuDNN autotune / first-touch memory)
-        bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size)
-        stats = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size)
+        bench_prefill_decode(tp_model, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
+        stats = bench_prefill_decode(tp_model, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
         comm = tp_model.layers[0].mixer.comm
         stats["allreduces_per_layer0"] = comm.count
         comm.reset()
@@ -146,8 +172,8 @@ def main():
         dense = MambaLM.from_pretrained(model_path, dtype=dtype).to(args.device).eval()
         log(rank, "-- single-GPU (no TP) comparison, rank 0 only --")
         for L in args.prompt_lens:
-            bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size)
-            stats = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size)
+            bench_prefill_decode(dense, L, min(4, args.n_new_tokens), args.device, args.batch_size, args.cuda_graph)
+            stats = bench_prefill_decode(dense, L, args.n_new_tokens, args.device, args.batch_size, args.cuda_graph)
             log(rank, f"[1-GPU dense] prompt_len={L}: {stats}")
             results.setdefault("single_gpu", {})[L] = stats
 
