@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .model import LayerCache, MambaConfig, MambaMixer
-from .tp_utils import ALLREDUCE_FNS, CommCounter, channel_slice
+from .tp_utils import ALLREDUCE_FNS, CommCounter, channel_slice, site_dtype
 
 
 class _TPMambaMixerBase(nn.Module):
@@ -47,16 +47,18 @@ class _TPMambaMixerBase(nn.Module):
     cache (LayerCache) is naturally sharded: conv_state/ssm_state only ever
     hold this rank's channel-shard, since they're built from local tensors."""
 
-    def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None, allreduce_dtype: str = "fp32"):
+    def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None, allreduce_dtype="fp32",
+                 layer_idx: int = 0):
         super().__init__()
         self.cfg = cfg
         self.rank = rank
         self.world_size = world_size
         self.group = group
         self.comm = CommCounter()
-        assert allreduce_dtype in ALLREDUCE_FNS, f"unknown allreduce_dtype {allreduce_dtype!r}"
+        self.layer_idx = layer_idx
         self.allreduce_dtype = allreduce_dtype
-        self._all_reduce = ALLREDUCE_FNS[allreduce_dtype]
+        self._ar_x = ALLREDUCE_FNS[site_dtype(allreduce_dtype, layer_idx, "x_proj")]
+        self._ar_out = ALLREDUCE_FNS[site_dtype(allreduce_dtype, layer_idx, "out_proj")]
 
         assert cfg.d_inner % world_size == 0
         self.shard = cfg.d_inner // world_size
@@ -99,7 +101,7 @@ class _TPMambaMixerBase(nn.Module):
 
         # partial sum over this rank's channel-shard of d_inner -> needs AllReduce to be correct
         x_dbl_partial = self.x_proj(x_ssm.transpose(1, 2))  # [b, l, dt_rank+2*d_state]
-        x_dbl = self._all_reduce(x_dbl_partial.contiguous(), self.group, self.comm)  # AllReduce #1
+        x_dbl = self._ar_x(x_dbl_partial.contiguous(), self.group, self.comm)  # AllReduce #1
         dt, B, C = torch.split(x_dbl, [dt_rank, d_state, d_state], dim=-1)
 
         dt = self.dt_proj.weight @ dt.transpose(1, 2) + self.dt_proj.bias[None, :, None]  # [b, shard, l]
@@ -124,7 +126,7 @@ class _TPMambaMixerBase(nn.Module):
         y = y * F.silu(z)
 
         out_partial = self.out_proj(y)  # [b, l, d_model], partial sum over this rank's channels
-        out = self._all_reduce(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
+        out = self._ar_out(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
         if self.out_bias is not None:
             out = out + self.out_bias
         return out, final_conv_state, ssm_state.to(x.dtype)
@@ -152,7 +154,7 @@ class _TPMambaMixerBase(nn.Module):
         x_ssm = F.silu(conv_out)  # [b, shard]
 
         x_dbl_partial = self.x_proj(x_ssm)  # [b, dt_rank+2*d_state]
-        x_dbl = self._all_reduce(x_dbl_partial.contiguous(), self.group, self.comm)  # AllReduce #1
+        x_dbl = self._ar_x(x_dbl_partial.contiguous(), self.group, self.comm)  # AllReduce #1
         dt, B, C = torch.split(x_dbl, [dt_rank, d_state, d_state], dim=-1)
         dt = F.linear(dt, self.dt_proj.weight, self.dt_proj.bias)  # [b, shard]
         dt = F.softplus(dt)
@@ -168,7 +170,7 @@ class _TPMambaMixerBase(nn.Module):
         y = y * F.silu(z)
 
         out_partial = self.out_proj(y)  # [b, d_model]
-        out = self._all_reduce(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
+        out = self._ar_out(out_partial.contiguous(), self.group, self.comm)  # AllReduce #2
         if self.out_bias is not None:
             out = out + self.out_bias
         return out
@@ -241,10 +243,10 @@ class NaiveTPMambaMixer(_TPMambaMixerBase):
 
 class TPMambaBlock(nn.Module):
     def __init__(self, cfg: MambaConfig, layer_idx: int, rank: int, world_size: int, group=None,
-                 allreduce_dtype: str = "fp32"):
+                 allreduce_dtype="fp32"):
         super().__init__()
         self.norm = _import_rmsnorm(cfg)
-        self.mixer = TPMambaMixer(cfg, rank, world_size, group, allreduce_dtype)
+        self.mixer = TPMambaMixer(cfg, rank, world_size, group, allreduce_dtype, layer_idx=layer_idx)
 
     def prefill(self, x, cache: LayerCache | None):
         residual = x
@@ -276,7 +278,7 @@ class TPMambaLM(nn.Module):
     (the actual point of TP), not just compute.
     """
 
-    def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None, allreduce_dtype: str = "fp32"):
+    def __init__(self, cfg: MambaConfig, rank: int, world_size: int, group=None, allreduce_dtype="fp32"):
         super().__init__()
         self.cfg = cfg
         self.rank = rank
@@ -325,7 +327,7 @@ class TPMambaLM(nn.Module):
     @classmethod
     def from_pretrained_shard(
         cls, hf_path: str, rank: int, world_size: int, group=None, dtype=torch.float32,
-        allreduce_dtype: str = "fp32",
+        allreduce_dtype="fp32",
     ) -> "TPMambaLM":
         """Loads a HF `state-spaces/mamba-*-hf` checkpoint (single-file or
         sharded safetensors), keeping in memory (per rank) only this rank's
