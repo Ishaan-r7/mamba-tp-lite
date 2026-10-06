@@ -11,7 +11,7 @@ paper's Table I:
 
 Still gloo/CPU/2-process; the actual speedup only shows up on real GPU
 bandwidth (see scripts/run_tp.py --allreduce-dtype and
-benchmarks/PHASE3_RESULTS.md's bandwidth-vs-latency prediction for Phase 4).
+benchmarks/tensor_parallel_results.md's bandwidth-vs-latency prediction for Phase 4).
 """
 import os
 import tempfile

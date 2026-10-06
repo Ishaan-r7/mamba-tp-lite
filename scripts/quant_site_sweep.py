@@ -2,7 +2,7 @@
 (layer x {x_proj, out_proj}) at a time, everything else fp32, and measure
 error vs. the fp32 reference. Results are saved after every config so an
 interrupted run resumes where it stopped.
-  python scripts/phase6_sweep.py --dtype int8 --n 64 --len 256
+  python scripts/quant_site_sweep.py --dtype int8 --n 64 --len 256
 """
 import argparse
 import json
@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--model-id", default="state-spaces/mamba-130m-hf")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    out = args.out or f"benchmarks/phase6/sweep_{args.dtype}.json"
+    out = args.out or f"benchmarks/quant_mixed/sweep_{args.dtype}.json"
 
     path = snapshot_download(args.model_id)
     n_layer = MambaConfig.from_hf_config(f"{path}/config.json").n_layer

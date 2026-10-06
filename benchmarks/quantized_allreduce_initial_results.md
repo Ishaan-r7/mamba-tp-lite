@@ -1,5 +1,7 @@
 # Phase 4 results: quantized AllReduce
 
+> **Superseded for INT8.** The INT8 path measured in this document summed `int32` values, so it did not reduce bytes on the wire. The corrected int8 collectives and their results are in [`mixed_precision_results.md`](mixed_precision_results.md). The FP16 results here still stand.
+
 Correctness/accuracy tests: `tests/test_quantized_allreduce.py` (gloo/CPU, real
 mamba-130m-hf weights, 42-token real text prompt -- not random token ids, see
 below for why that matters).

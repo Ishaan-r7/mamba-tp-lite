@@ -1,6 +1,6 @@
 """
 Generates the static charts embedded in README.md, from the real numbers
-recorded in NOTES.md / benchmarks/PHASE3_RESULTS.md / PHASE4_RESULTS.md.
+recorded in NOTES.md / benchmarks/tensor_parallel_results.md / quantized_allreduce_initial_results.md.
 Not a live benchmark runner -- just plots already-measured results so the
 README doesn't need a notebook to render.
 
@@ -63,7 +63,7 @@ ax.set_title("Phase 1: SSM cache keeps decode O(1), not O(prompt length)")
 for xi, c, n in zip(x, cached_ms, nocache_ms):
     ax.annotate(f"{n/c:.0f}x", (xi, n), ha="center", va="bottom", fontsize=10, color="#333")
 ax.legend()
-savefig(fig, "phase1_cache_speedup.png")
+savefig(fig, "cache_speedup.png")
 
 # ---------------------------------------------------------------------------
 # 2. Phase 3: decode throughput, TP vs 1-GPU (mamba-130m, batch=1, Kaggle 2xT4)
@@ -82,7 +82,7 @@ ax.set_xlabel("prompt length (tokens)")
 ax.set_ylabel("decode tokens / sec")
 ax.set_title("Phase 3: single-token decode -- TP loses (comm-bound)")
 ax.legend()
-savefig(fig, "phase3_decode_tp_vs_1gpu.png")
+savefig(fig, "tp_decode_vs_1gpu.png")
 
 # ---------------------------------------------------------------------------
 # 3. Phase 3: prefill throughput crossover as batch size grows
@@ -105,7 +105,7 @@ for ax, tp_vals, gpu_vals, L in zip(axes, [tp_prefill_256, tp_prefill_1024], [gp
     ax.legend()
 axes[0].set_ylabel("prefill tokens / sec")
 fig.suptitle("Phase 3: prefill throughput -- TP wins once batch saturates a single GPU", y=1.02, fontweight="bold")
-savefig(fig, "phase3_prefill_crossover.png")
+savefig(fig, "tp_prefill_crossover.png")
 
 # ---------------------------------------------------------------------------
 # 4. Phase 4: quantization accuracy table (Top-1 / Top-5 unordered / ordered)
@@ -128,7 +128,7 @@ for xi, v in zip(x - w / 2, fp16_vals):
 for xi, v in zip(x + w / 2, int8_vals):
     ax.annotate(f"{v:.1f}", (xi, v), ha="center", va="bottom", fontsize=9)
 ax.legend(loc="lower left")
-savefig(fig, "phase4_quant_accuracy.png")
+savefig(fig, "quant_initial_accuracy.png")
 
 # ---------------------------------------------------------------------------
 # 5. Phase 4: fp16 AllReduce speed change, same-session controlled
@@ -145,7 +145,7 @@ ax.set_title("Phase 4: fp16 AllReduce helps compute-bound prefill,\nhurts latenc
 for b, v in zip(bars, pct_change):
     ax.annotate(f"{v:+.1f}%", (b.get_x() + b.get_width() / 2, v),
                 ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
-savefig(fig, "phase4_fp16_speed_change.png")
+savefig(fig, "quant_initial_fp16_speed.png")
 
 # ---------------------------------------------------------------------------
 # 6. Phase 5: CUDA graph decode speedup, verified correct (same-session)
@@ -170,7 +170,7 @@ for ax, eager, graphed, title in zip(axes, [tp_eager, gpu1_eager], [tp_graphed, 
     ax.legend()
 axes[0].set_ylabel("decode tokens / sec")
 fig.suptitle("Phase 5: CUDA graphs speed up decode ~2.5-3.7x\n(verified bit-exact correct, not just faster)", y=1.06, fontweight="bold")
-savefig(fig, "phase5_cuda_graph_speedup.png")
+savefig(fig, "cuda_graph_speedup.png")
 
 print("done")
 
@@ -180,7 +180,7 @@ print("done")
 # ---------------------------------------------------------------------------
 import json
 
-P6 = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "phase6")
+P6 = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "quant_mixed")
 COLOR_FP32 = "#616161"
 COLOR_MIXED = "#1565C0"
 
@@ -205,7 +205,7 @@ ax.bar([0], [0], color=COLOR_INT8, label="out_proj (AllReduce #2)")
 ax.bar([0], [0], color=COLOR_TP, label="x_proj (AllReduce #1)")
 ax.legend(loc="upper right")
 ax.set_xlim(-0.8, len(items) - 0.2)
-savefig(fig, "phase6_site_sensitivity.png")
+savefig(fig, "quant_site_sensitivity.png")
 
 par = _load6("pareto.json")
 fig, ax = plt.subplots(figsize=(7, 4.4))
@@ -226,7 +226,7 @@ ax.set_xlabel("number of collectives in INT8 (of 48)")
 ax.set_ylabel("KL vs fp32 logits")
 ax.set_title("Mixed precision: error vs INT8 coverage")
 ax.legend(fontsize=9, loc="upper left")
-savefig(fig, "phase6_pareto.png")
+savefig(fig, "quant_pareto.png")
 
 gpu = _load6("gpu_results.json")["summary"]
 names = ["fp32", "fp16", "int8", "mixed_1fp16", "mixed_5fp16"]
@@ -251,4 +251,4 @@ ax.set_ylabel("speed vs fp32 (>1 = faster)")
 ax.set_title("AllReduce precision on 2x T4, same session (mamba-130m)")
 ax.set_ylim(0, 1.25)
 ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=3, fontsize=9, frameon=False)
-savefig(fig, "phase6_gpu_speed.png")
+savefig(fig, "quant_gpu_speed.png")

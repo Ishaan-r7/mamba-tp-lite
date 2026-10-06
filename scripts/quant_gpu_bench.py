@@ -9,9 +9,9 @@ Per config it measures
 and first sanity-checks that int8 / graph capture are numerically sane on NCCL.
 
 Run on a 2-GPU box:
-  torchrun --standalone --nproc_per_node=2 scripts/phase6_gpu_bench.py \
-      --mixed-json benchmarks/phase6/mixed_configs.json
-Rank 0 prints a final line starting with PHASE6_GPU_RESULT_JSON: -- paste that back.
+  torchrun --standalone --nproc_per_node=2 scripts/quant_gpu_bench.py \
+      --mixed-json benchmarks/quant_mixed/mixed_configs.json
+Rank 0 prints a final line starting with QUANT_GPU_RESULT_JSON: -- paste that back.
 """
 import argparse
 import json
@@ -51,14 +51,14 @@ def reset_comm(model):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", default="state-spaces/mamba-130m-hf")
-    ap.add_argument("--mixed-json", default="benchmarks/phase6/mixed_configs.json")
+    ap.add_argument("--mixed-json", default="benchmarks/quant_mixed/mixed_configs.json")
     ap.add_argument("--configs", nargs="+", default=None, help="subset/order of config names")
     ap.add_argument("--prefill-batch", type=int, default=32)
     ap.add_argument("--prefill-len", type=int, default=1024)
     ap.add_argument("--decode-prompt-len", type=int, default=256)
     ap.add_argument("--n-new-tokens", type=int, default=64)
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--out", default="phase6_gpu_results.json")
+    ap.add_argument("--out", default="quant_gpu_results.json")
     ap.add_argument("--cpu-smoke", action="store_true", help="gloo/CPU dry run to check the script logic (no timing value)")
     args = ap.parse_args()
 
@@ -166,7 +166,7 @@ def main():
         result = {"model": args.model_id, "world_size": world_size, "device": "cpu" if args.cpu_smoke else torch.cuda.get_device_name(0),
                   "args": vars(args), "sanity": sanity, "summary": summary}
         json.dump(result, open(args.out, "w"))
-        print("PHASE6_GPU_RESULT_JSON:" + json.dumps(result), flush=True)
+        print("QUANT_GPU_RESULT_JSON:" + json.dumps(result), flush=True)
     dist.barrier()
     dist.destroy_process_group()
 

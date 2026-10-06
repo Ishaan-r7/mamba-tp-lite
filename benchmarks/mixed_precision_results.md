@@ -8,7 +8,7 @@ Short answer: **accuracy yes, speed no (on this model and hardware).** 43 of 48
 collectives run in INT8 at KL 0.0005 vs fp32, but on 2x T4 over PCIe the
 quantized variants give no measurable prefill gain and slower decode.
 
-Raw data: `benchmarks/phase6/*.json`. Charts: `assets/phase6_*.png`.
+Raw data: `benchmarks/quant_mixed/*.json`. Charts: `assets/quant_*.png`.
 Everything below was measured with `mamba-130m-hf`.
 
 ## 1. A bug in the Phase 4 INT8 path
@@ -52,7 +52,7 @@ passages x 256 tokens, all-48-sites quantized, reference = fp32 TP logits:
 
 ## 2. Which collectives are fragile (INT8 at one site, rest fp32)
 
-64 passages x 256 tokens. Chart: `assets/phase6_site_sensitivity.png`.
+64 passages x 256 tokens. Chart: `assets/quant_site_sensitivity.png`.
 
 - **One site dominates:** layer 23 `out_proj` alone gives KL 0.0101, about 80% of
   the all-INT8 damage (0.0127). Next worst: layer 22/21/0/20 `out_proj`
@@ -63,7 +63,7 @@ passages x 256 tokens, all-48-sites quantized, reference = fp32 TP logits:
 
 ## 3. Mixed precision
 
-Chart: `assets/phase6_pareto.png`. Each combination was measured directly
+Chart: `assets/quant_pareto.png`. Each combination was measured directly
 (single-site errors do not add up exactly).
 
 - Adding the least-sensitive sites to INT8 in order: KL stays below 4e-4 up to
@@ -85,7 +85,7 @@ Two configs go to hardware: `mixed_1fp16` (47 INT8) and `mixed_5fp16` (43 INT8).
 ## 4. Speed on 2x Tesla T4 (Kaggle, same session)
 
 fp32, fp16, INT8 and both mixed configs run back-to-back in one process, 3
-interleaved rounds, median reported. Chart: `assets/phase6_gpu_speed.png`.
+interleaved rounds, median reported. Chart: `assets/quant_gpu_speed.png`.
 
 Before timing, each config was checked on NCCL: finite logits, KL vs fp32, and
 CUDA-graph output vs eager.
@@ -168,9 +168,9 @@ Reading it:
 
 ```bash
 # accuracy (CPU)
-.venv/bin/python scripts/phase6_eval.py --n 100 --len 256
-.venv/bin/python scripts/phase6_sweep.py --dtype int8   # and --dtype fp16
-.venv/bin/python scripts/phase6_pareto.py
+.venv/bin/python scripts/quant_eval_global.py --n 100 --len 256
+.venv/bin/python scripts/quant_site_sweep.py --dtype int8   # and --dtype fp16
+.venv/bin/python scripts/quant_mixed_search.py
 # speed (2 GPUs)
-torchrun --standalone --nproc_per_node=2 scripts/phase6_gpu_bench.py
+torchrun --standalone --nproc_per_node=2 scripts/quant_gpu_bench.py
 ```

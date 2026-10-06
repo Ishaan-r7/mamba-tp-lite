@@ -36,8 +36,8 @@ def main():
     ap.add_argument("--greedy-candidates", type=int, default=10)
     ap.add_argument("--greedy-steps", type=int, default=6)
     ap.add_argument("--model-id", default="state-spaces/mamba-130m-hf")
-    ap.add_argument("--sweep", default="benchmarks/phase6/sweep_int8.json")
-    ap.add_argument("--out", default="benchmarks/phase6/pareto.json")
+    ap.add_argument("--sweep", default="benchmarks/quant_mixed/sweep_int8.json")
+    ap.add_argument("--out", default="benchmarks/quant_mixed/pareto.json")
     args = ap.parse_args()
 
     path = snapshot_download(args.model_id)

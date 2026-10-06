@@ -73,7 +73,7 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   single-file and sharded (`*.index.json`) checkpoints, shared by both
   `MambaLM.from_pretrained` and `TPMambaLM.from_pretrained_shard`.
 - **Contribution:** the compute-bound-vs-latency-bound framing itself — full
-  writeup in `benchmarks/PHASE3_RESULTS.md`. This wasn't just "reproduce the
+  writeup in `benchmarks/tensor_parallel_results.md`. This wasn't just "reproduce the
   paper's number," it's an independently-found explanation of *when* TP
   helps, backed by a controlled sweep (model size x batch size x workload
   phase) rather than a single headline number.
@@ -93,7 +93,7 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   matches the paper. INT8 keeps 64% Top-1 but nearly destroys fine-grained
   ranking (2.4% Top-5 ordered) once compounded over 24 layers x 2
   AllReduces = 48 quantization events per forward pass. Full table and the
-  planned GPU speedup test in `benchmarks/PHASE4_RESULTS.md`.
+  planned GPU speedup test in `benchmarks/quantized_allreduce_initial_results.md`.
 - **Unexpected:** the first version of the accuracy test used random token
   ids as the prompt instead of real text. That alone dropped INT8's Top-1
   from 64.3% to 43.8% -- out-of-distribution activations widen the tensor's
@@ -109,7 +109,7 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   a pass/fail threshold).
 
 - **GPU follow-up (Kaggle 2xT4, same-session controlled runs -- see
-  `benchmarks/PHASE4_RESULTS.md`):** FP16 AllReduce makes decode
+  `benchmarks/quantized_allreduce_initial_results.md`):** FP16 AllReduce makes decode
   consistently *worse* (-9% to -16% across prompt lengths 64/256/1024) --
   sharper than predicted; the two extra cast kernels per call are pure
   overhead when the payload is already tiny and latency-bound. FP16
@@ -140,7 +140,7 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   close) and a consistent **~2.5-3.7x decode speedup**, both TP and
   single-GPU, across all three prompt lengths tested. Confirms Phase 3's
   launch-overhead hypothesis directly. Full numbers in
-  `benchmarks/PHASE5_RESULTS.md`.
+  `benchmarks/cuda_graph_results.md`.
 - **Unexpected -- two real bugs, caught specifically because a correctness
   check was built before trusting any speed number:**
   1. Warmup calls ran against the *real* cache before capture, and `step()`
@@ -181,11 +181,11 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   new INT8 variants (`int8_sum`, `int8_gather`, `int8_gather_tok`); eval harness
   (`mamba_lite/quant_eval.py`: KL / Top-1 / Top-5 vs fp32 on Simple English
   Wikipedia); single-site sweeps, Pareto curve and greedy search; one
-  back-to-back 2xT4 benchmark (`scripts/phase6_gpu_bench.py`).
+  back-to-back 2xT4 benchmark (`scripts/quant_gpu_bench.py`).
 - **Result:** accuracy yes, speed no. 43/48 collectives in INT8 (5 out_proj kept
   fp16) gives KL 0.0005, Top-1 98.8%; layer 23 out_proj alone is ~80% of the
   all-INT8 damage. On 2xT4 nothing beats fp32 by more than FP16's ~+5% prefill;
-  INT8 variants are ~30% slower on decode. Full numbers: `benchmarks/PHASE6_RESULTS.md`.
+  INT8 variants are ~30% slower on decode. Full numbers: `benchmarks/mixed_precision_results.md`.
 - **Unexpected:**
   1. Phase 4's INT8 sent int32 through the SUM collective, so it saved no
      bandwidth at all. Caught while planning the speed test, before measuring.

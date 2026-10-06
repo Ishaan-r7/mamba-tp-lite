@@ -1,6 +1,6 @@
 """Whole-model quantization error on Simple English Wikipedia passages
 (fp32 TP logits as the reference). Usage:
-  python scripts/phase6_eval.py --n 64 --len 128 --out benchmarks/phase6/eval_global.json
+  python scripts/quant_eval_global.py --n 64 --len 128 --out benchmarks/quant_mixed/eval_global.json
 """
 import argparse
 import json
@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--configs", nargs="+", default=CONFIGS)
     ap.add_argument("--model-id", default="state-spaces/mamba-130m-hf")
-    ap.add_argument("--out", default="benchmarks/phase6/eval_global.json")
+    ap.add_argument("--out", default="benchmarks/quant_mixed/eval_global.json")
     args = ap.parse_args()
 
     path = snapshot_download(args.model_id)
