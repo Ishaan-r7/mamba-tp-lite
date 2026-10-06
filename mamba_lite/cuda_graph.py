@@ -17,9 +17,9 @@ https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs
 Requires a real CUDA device -- there is no CPU/gloo fallback for this,
 unlike every earlier phase. Also requires the model's step() to contain no
 GPU->CPU syncs (no `.item()`, no data-dependent Python control flow) in the
-captured region -- our int8 quantized AllReduce violates this (its scale
-sync calls `.item()`), so it is explicitly rejected below rather than
-silently miscapturing.
+captured region -- the legacy int8 AllReduce (`int8_legacy`) violates this
+(its scale sync calls `.item()`), so it is explicitly rejected below rather
+than silently miscapturing. The current int8 variants keep scales on the GPU.
 """
 from __future__ import annotations
 
@@ -64,11 +64,11 @@ class GraphedStepper:
                 "CUDA graphs require a real CUDA device; there is no CPU/gloo fallback."
             )
         allreduce_dtype = getattr(model, "allreduce_dtype", "fp32")
-        if allreduce_dtype == "int8":
+        names = {allreduce_dtype} if isinstance(allreduce_dtype, str) else set(allreduce_dtype.values())
+        if "int8_legacy" in names:
             raise CUDAGraphUnsupported(
-                "int8 AllReduce calls .item() to sync its quantization scale (a GPU->CPU "
-                "sync), which cannot be captured in a CUDA graph. Use --allreduce-dtype "
-                "fp32 or fp16 with --cuda-graph."
+                "int8_legacy AllReduce calls .item() to sync its quantization scale (a GPU->CPU "
+                "sync), which cannot be captured in a CUDA graph. Use another --allreduce-dtype."
             )
 
         self.model = model

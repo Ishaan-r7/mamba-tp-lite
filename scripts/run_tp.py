@@ -28,6 +28,7 @@ from huggingface_hub import snapshot_download
 from mamba_lite.cuda_graph import CUDAGraphUnsupported, GraphedStepper
 from mamba_lite.model import MambaLM
 from mamba_lite.tp_model import TPMambaLM
+from mamba_lite.tp_utils import ALLREDUCE_FNS
 
 
 def log(rank, msg):
@@ -147,8 +148,8 @@ def main():
                      help="HF hub id to download, e.g. state-spaces/mamba-1.4b-hf")
     ap.add_argument("--backend", default="nccl", choices=["nccl", "gloo"])
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    ap.add_argument("--allreduce-dtype", default="fp32", choices=["fp32", "fp16", "int8"],
-                     help="precision used for the AllReduce collective only (Phase 4)")
+    ap.add_argument("--allreduce-dtype", default="fp32", choices=sorted(ALLREDUCE_FNS),
+                     help="precision used for the AllReduce collective only (Phase 4/6); int8 = per-token int8 all-gather")
     ap.add_argument("--prompt-lens", type=int, nargs="+", default=[16, 64, 256])
     ap.add_argument("--n-new-tokens", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=1)
@@ -162,7 +163,7 @@ def main():
     ap.add_argument("--profile-dir", default="profiles")
     ap.add_argument("--cuda-graph", action="store_true",
                      help="Phase 5: capture the decode step as a CUDA graph (requires --device cuda; "
-                          "not compatible with --allreduce-dtype int8, which needs a GPU->CPU sync)")
+                          "not compatible with --allreduce-dtype int8_legacy, which needs a GPU->CPU sync)")
     ap.add_argument("--compare-cuda-graph", action="store_true",
                      help="run both eager and graphed decode back-to-back in this same process, "
                           "for a same-session apples-to-apples speedup number (implies --cuda-graph)")

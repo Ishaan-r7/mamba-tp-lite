@@ -100,23 +100,17 @@ def all_reduce_sum_int8_sum(tensor: torch.Tensor, group=None, counter: CommCount
     return (q.float() * scale).to(orig_dtype)
 
 
-def all_reduce_sum_int8_gather(tensor: torch.Tensor, group=None, counter: CommCounter | None = None) -> torch.Tensor:
-    """INT8 on the wire via all-gather: each rank quantizes with its OWN scale
-    (full +-127), packs the 4 scale bytes in front of its int8 payload, one
-    all-gather moves the packed bytes, and every rank dequantizes and sums
-    the gathered pieces locally in rank order (so all ranks get an identical
-    result). One collective per call, no scale-sync AllReduce, no GPU->CPU
-    sync. Traffic matches an AllReduce at world_size=2 but grows with more
-    ranks."""
+def _int8_gather(tensor: torch.Tensor, group, counter, per_token: bool) -> torch.Tensor:
     orig_dtype = tensor.dtype
     ws = dist.get_world_size(group)
     shape = tensor.shape
-    t = tensor.contiguous().float().reshape(-1)
-    n = t.numel()
+    cols = shape[-1] if per_token else tensor.numel()
+    t = tensor.contiguous().float().reshape(-1, cols)  # [rows, cols]; one row total when per-tensor
+    rows = t.shape[0]
 
-    scale = (t.abs().max().clamp(min=1e-8) / 127.0).reshape(1)
-    q = (t / scale).round().clamp(-127, 127).to(torch.int8)
-    payload = torch.cat([scale.view(torch.uint8), q.view(torch.uint8)])  # scale first: 4-byte aligned
+    scale = (t.abs().amax(dim=1).clamp(min=1e-8) / 127.0)  # [rows]
+    q = (t / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
+    payload = torch.cat([scale.view(torch.uint8), q.view(torch.uint8).reshape(-1)])  # scales first: 4-byte aligned
     if counter is not None:
         counter.count += 1
         counter.bytes += payload.numel()
@@ -130,20 +124,39 @@ def all_reduce_sum_int8_gather(tensor: torch.Tensor, group=None, counter: CommCo
         dist.all_gather(bufs, payload, group=group)
         pieces = torch.stack(bufs)
 
-    out = torch.zeros(n, dtype=torch.float32, device=t.device)
+    out = torch.zeros(rows, cols, dtype=torch.float32, device=t.device)
     for r in range(ws):
-        s_r = pieces[r, :4].contiguous().view(torch.float32)
-        out += pieces[r, 4:].view(torch.int8).float() * s_r
+        s_r = pieces[r, : 4 * rows].contiguous().view(torch.float32)
+        out += pieces[r, 4 * rows:].view(torch.int8).reshape(rows, cols).float() * s_r[:, None]
     return out.reshape(shape).to(orig_dtype)
+
+
+def all_reduce_sum_int8_gather(tensor: torch.Tensor, group=None, counter: CommCounter | None = None) -> torch.Tensor:
+    """INT8 on the wire via all-gather: each rank quantizes with its OWN
+    per-tensor scale (full +-127), packs the 4 scale bytes in front of its
+    int8 payload, one all-gather moves the packed bytes, and every rank
+    dequantizes and sums the gathered pieces locally in rank order (so all
+    ranks get an identical result). One collective per call, no scale-sync
+    AllReduce, no GPU->CPU sync. Traffic matches an AllReduce at
+    world_size=2 but grows with more ranks."""
+    return _int8_gather(tensor, group, counter, per_token=False)
+
+
+def all_reduce_sum_int8_gather_tok(tensor: torch.Tensor, group=None, counter: CommCounter | None = None) -> torch.Tensor:
+    """Same as int8_gather but one scale per token (per row of the last dim),
+    so a few outlier tokens/channels no longer set the quantization grid for
+    the whole tensor. Costs 4 extra bytes per row on the wire."""
+    return _int8_gather(tensor, group, counter, per_token=True)
 
 
 ALLREDUCE_FNS = {
     "fp32": all_reduce_sum,
     "fp16": all_reduce_sum_fp16,
-    "int8": all_reduce_sum_int8_legacy,  # alias, to be repointed once the Phase 6 comparison picks a variant
+    "int8": all_reduce_sum_int8_gather_tok,  # Phase 6 winner: per-token scales, int8 on the wire, one collective
     "int8_legacy": all_reduce_sum_int8_legacy,
     "int8_sum": all_reduce_sum_int8_sum,
     "int8_gather": all_reduce_sum_int8_gather,
+    "int8_gather_tok": all_reduce_sum_int8_gather_tok,
 }
 
 

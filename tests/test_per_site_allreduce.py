@@ -25,6 +25,7 @@ CASES = {
     "int8_out_only_miss": ({(LAYER, "out_proj"): "int8_gather"}, LAYER + 1),
     "int8_x_only": ({(LAYER, "x_proj"): "int8_gather"}, LAYER),
     "int8_gather_all": ("int8_gather", LAYER),
+    "int8_gather_tok_all": ("int8_gather_tok", LAYER),
     "int8_sum_all": ("int8_sum", LAYER),
     "int8_legacy_all": ("int8_legacy", LAYER),
     "fp16_all": ("fp16", LAYER),
@@ -85,7 +86,7 @@ def test_per_site_hook_and_int8_variants():
     assert torch.allclose(base, dense, atol=1e-5)
 
     # CommCounter: exactly 2 per forward for fp32/fp16/int8_gather; sum-variant and legacy pay a scale collective per site
-    for name in ("fp32_str", "fp32_map", "empty_map", "fp16_all", "int8_gather_all",
+    for name in ("fp32_str", "fp32_map", "empty_map", "fp16_all", "int8_gather_all", "int8_gather_tok_all",
                  "int8_out_only_hit", "int8_x_only", "int8_out_only_miss"):
         assert r0[name][1] == 2, (name, r0[name][1])
     assert r0["int8_sum_all"][1] == 4 and r0["int8_legacy_all"][1] == 4
@@ -97,6 +98,7 @@ def test_per_site_hook_and_int8_variants():
 
     # real int8 on the wire: payload bytes per call shrink vs fp32, legacy (int32) does not
     assert r0["int8_gather_all"][2] < r0["fp32_str"][2] / 3
+    assert r0["int8_gather_tok_all"][2] < r0["fp32_str"][2] / 3
     assert r0["int8_legacy_all"][2] >= r0["fp32_str"][2]
 
     # all ranks must end up with the identical (post-collective) output
@@ -104,7 +106,7 @@ def test_per_site_hook_and_int8_variants():
         assert torch.equal(res[0][name][0], res[1][name][0]), name
 
     # lossy but close
-    for name in ("int8_gather_all", "int8_sum_all", "int8_legacy_all", "fp16_all"):
+    for name in ("int8_gather_all", "int8_gather_tok_all", "int8_sum_all", "int8_legacy_all", "fp16_all"):
         err = (res[0][name][0] - dense).abs().max().item()
         scale = dense.abs().max().item()
         assert err < 0.15 * scale, (name, err, scale)

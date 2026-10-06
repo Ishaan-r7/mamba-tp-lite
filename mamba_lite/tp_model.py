@@ -56,9 +56,7 @@ class _TPMambaMixerBase(nn.Module):
         self.group = group
         self.comm = CommCounter()
         self.layer_idx = layer_idx
-        self.allreduce_dtype = allreduce_dtype
-        self._ar_x = ALLREDUCE_FNS[site_dtype(allreduce_dtype, layer_idx, "x_proj")]
-        self._ar_out = ALLREDUCE_FNS[site_dtype(allreduce_dtype, layer_idx, "out_proj")]
+        self.set_allreduce_dtype(allreduce_dtype)
 
         assert cfg.d_inner % world_size == 0
         self.shard = cfg.d_inner // world_size
@@ -73,6 +71,11 @@ class _TPMambaMixerBase(nn.Module):
         self.D = nn.Parameter(torch.empty(shard))
         self.out_proj = nn.Linear(shard, cfg.d_model, bias=False)  # bias handled manually (rank 0 only)
         self.out_bias = nn.Parameter(torch.zeros(cfg.d_model)) if cfg.bias else None
+
+    def set_allreduce_dtype(self, allreduce_dtype) -> None:
+        self.allreduce_dtype = allreduce_dtype
+        self._ar_x = ALLREDUCE_FNS[site_dtype(allreduce_dtype, self.layer_idx, "x_proj")]
+        self._ar_out = ALLREDUCE_FNS[site_dtype(allreduce_dtype, self.layer_idx, "out_proj")]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Convenience wrapper for the mixer-only tests: full sequence, no cache."""
@@ -290,6 +293,11 @@ class TPMambaLM(nn.Module):
             [TPMambaBlock(cfg, i, rank, world_size, group, allreduce_dtype) for i in range(cfg.n_layer)]
         )
         self.norm_f = _import_rmsnorm(cfg)
+
+    def set_allreduce_dtype(self, allreduce_dtype) -> None:
+        self.allreduce_dtype = allreduce_dtype
+        for layer in self.layers:
+            layer.mixer.set_allreduce_dtype(allreduce_dtype)
 
     def lm_head(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.embedding.weight)
