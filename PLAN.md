@@ -103,6 +103,13 @@ addresses regardless of Python-level variable reassignment), the difference
 between "reduces work" and "reduces launch overhead" optimizations, and
 where NCCL-in-graph-capture support is and isn't solid in practice.
 
+## Phase 6 — Mixed-precision AllReduce
+
+Find which of the 48 collectives tolerate INT8 (single-site sweeps, Pareto,
+greedy), fix INT8 to send real int8, and compare fp32/fp16/INT8/mixed speed
+back-to-back on 2xT4. Done; see `benchmarks/PHASE6_RESULTS.md`. Static
+calibrated scales were considered and not built.
+
 ## Other stretch ideas (not started)
 
 - Write the selective-scan decode step as a Triton kernel.

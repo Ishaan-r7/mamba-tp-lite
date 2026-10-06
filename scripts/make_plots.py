@@ -173,3 +173,82 @@ fig.suptitle("Phase 5: CUDA graphs speed up decode ~2.5-3.7x\n(verified bit-exac
 savefig(fig, "phase5_cuda_graph_speedup.png")
 
 print("done")
+
+
+# ---------------------------------------------------------------------------
+# 7. Phase 6: per-site INT8 sensitivity (48 collectives), Pareto, GPU speed
+# ---------------------------------------------------------------------------
+import json
+
+P6 = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "phase6")
+COLOR_FP32 = "#616161"
+COLOR_MIXED = "#1565C0"
+
+
+def _load6(name):
+    with open(os.path.join(P6, name)) as f:
+        return json.load(f)
+
+
+sweep = _load6("sweep_int8.json")["sites"]
+items = sorted(((k, v["summary"]["kl"]["mean"]) for k, v in sweep.items()), key=lambda kv: -kv[1])
+fig, ax = plt.subplots(figsize=(11, 4.4))
+colors = [COLOR_INT8 if k.endswith("out_proj") else COLOR_TP for k, _ in items]
+ax.bar(range(len(items)), [v for _, v in items], color=colors)
+ax.set_yscale("log")
+ax.set_xticks(range(len(items)))
+ax.set_xticklabels([f"L{k.split(':')[0]} {'out' if k.endswith('out_proj') else 'x'}" for k, _ in items],
+                   rotation=90, fontsize=7.5)
+ax.set_ylabel("KL(fp32 || INT8 at this site only)")
+ax.set_title("Single-site INT8 damage: 48 AllReduce collectives, sorted (mamba-130m)")
+ax.bar([0], [0], color=COLOR_INT8, label="out_proj (AllReduce #2)")
+ax.bar([0], [0], color=COLOR_TP, label="x_proj (AllReduce #1)")
+ax.legend(loc="upper right")
+ax.set_xlim(-0.8, len(items) - 0.2)
+savefig(fig, "phase6_site_sensitivity.png")
+
+par = _load6("pareto.json")
+fig, ax = plt.subplots(figsize=(7, 4.4))
+for key, label, col in (("pareto_fp32_rest", "rest of sites fp32", COLOR_FP32),
+                        ("pareto_fp16_rest", "rest of sites fp16", COLOR_FP16)):
+    pts = [(p["k"], p["summary"]["kl"]["mean"]) for p in par[key] if p["k"] > 0]
+    ax.plot([a for a, _ in pts], [b for _, b in pts], marker="o", ms=4, color=col, label=label, lw=1.6)
+g = par["greedy"]
+ax.plot([48 - i for i in range(len(g))], [x["summary"]["kl"]["mean"] for x in g], marker="s", ms=6,
+        color=COLOR_MIXED, lw=1.6, label="greedy: move most-damaging site to fp16")
+ax.annotate("all 48 INT8", (48, g[0]["summary"]["kl"]["mean"]), xytext=(38.5, 1.0e-2), textcoords="data",
+            fontsize=10, va="center", arrowprops=dict(arrowstyle="-", color="#888"))
+ax.annotate("43 INT8 + 5 fp16\n(mixed_5fp16)", (43, g[5]["summary"]["kl"]["mean"]), xytext=(33, 6e-5),
+            textcoords="data", fontsize=10, va="center", arrowprops=dict(arrowstyle="-", color="#888"))
+ax.set_yscale("log")
+ax.set_ylim(7e-6, 3e-2)
+ax.set_xlabel("number of collectives in INT8 (of 48)")
+ax.set_ylabel("KL vs fp32 logits")
+ax.set_title("Mixed precision: error vs INT8 coverage")
+ax.legend(fontsize=9, loc="upper left")
+savefig(fig, "phase6_pareto.png")
+
+gpu = _load6("gpu_results.json")["summary"]
+names = ["fp32", "fp16", "int8", "mixed_1fp16", "mixed_5fp16"]
+labels = ["fp32", "fp16", "INT8\n(all 48)", "mixed\n1 fp16", "mixed\n5 fp16"]
+base = gpu["fp32"]
+series = [
+    ("prefill, batch 32 x 1024", [gpu[n]["prefill_tok_s_median"] / base["prefill_tok_s_median"] for n in names], COLOR_TP),
+    ("decode, eager", [base["decode_eager_ms_median"] / gpu[n]["decode_eager_ms_median"] for n in names], COLOR_1GPU),
+    ("decode, CUDA graph", [base["decode_graph_ms_median"] / gpu[n]["decode_graph_ms_median"] for n in names], COLOR_CACHED),
+]
+fig, ax = plt.subplots(figsize=(9, 4.4))
+x = np.arange(len(names))
+w = 0.26
+for i, (lab, vals, col) in enumerate(series):
+    ax.bar(x + (i - 1) * w, vals, w, label=lab, color=col)
+    for xi, v in zip(x + (i - 1) * w, vals):
+        ax.text(xi, v + 0.015, f"{v:.2f}", ha="center", fontsize=8)
+ax.axhline(1.0, color="#444", lw=1)
+ax.set_xticks(x)
+ax.set_xticklabels(labels)
+ax.set_ylabel("speed vs fp32 (>1 = faster)")
+ax.set_title("AllReduce precision on 2x T4, same session (mamba-130m)")
+ax.set_ylim(0, 1.25)
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=3, fontsize=9, frameon=False)
+savefig(fig, "phase6_gpu_speed.png")

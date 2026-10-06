@@ -24,12 +24,13 @@ Single-token decode is a different story — communication overhead dominates at
 
 <img src="assets/phase1_cache_speedup.png" width="500">
 
-**Quantized AllReduce: FP16 is near-lossless, INT8 trades accuracy for bandwidth**
+**Mixed-precision AllReduce: 43 of 48 collectives in INT8 at KL 0.0005 vs fp32 (Top-1 98.8%), with per-token scales and int8 on the wire. On 2x T4 over PCIe the speed gain isn't there: FP16 is about +5% prefill / -5% decode, INT8 is within noise on prefill and ~30% slower on decode**
 
-<img src="assets/phase4_quant_accuracy.png" width="500">
-<img src="assets/phase4_fp16_speed_change.png" width="500">
+<img src="assets/phase6_site_sensitivity.png" width="700">
+<img src="assets/phase6_pareto.png" width="500">
+<img src="assets/phase6_gpu_speed.png" width="600">
 
-Full numbers: [`benchmarks/PHASE3_RESULTS.md`](benchmarks/PHASE3_RESULTS.md), [`benchmarks/PHASE4_RESULTS.md`](benchmarks/PHASE4_RESULTS.md), [`benchmarks/PHASE5_RESULTS.md`](benchmarks/PHASE5_RESULTS.md). Regenerate charts with `.venv/bin/python scripts/make_plots.py`.
+Full numbers: [`benchmarks/PHASE3_RESULTS.md`](benchmarks/PHASE3_RESULTS.md), [`benchmarks/PHASE4_RESULTS.md`](benchmarks/PHASE4_RESULTS.md), [`benchmarks/PHASE5_RESULTS.md`](benchmarks/PHASE5_RESULTS.md), [`benchmarks/PHASE6_RESULTS.md`](benchmarks/PHASE6_RESULTS.md). Regenerate charts with `.venv/bin/python scripts/make_plots.py`.
 
 ## Components
 
@@ -38,7 +39,7 @@ Full numbers: [`benchmarks/PHASE3_RESULTS.md`](benchmarks/PHASE3_RESULTS.md), [`
 | Model | [`mamba_lite/model.py`](mamba_lite/model.py) | Mamba forward pass: `prefill()` for the full scan, `step()` for cached recurrent decode. |
 | Tensor parallelism | [`mamba_lite/tp_model.py`](mamba_lite/tp_model.py) | Channel-sharded mixer, exactly 2 AllReduces per block. Includes a deliberately incorrect `NaiveTPMambaMixer` used in tests to catch a packed-tensor sharding bug. |
 | Benchmark/profiling | [`scripts/run_tp.py`](scripts/run_tp.py) | `torchrun`-launched throughput and `torch.profiler` harness. |
-| Quantized communication | [`mamba_lite/tp_utils.py`](mamba_lite/tp_utils.py) | FP16/INT8 AllReduce with an accuracy check (Top-1/Top-5 agreement). |
+| Quantized communication | [`mamba_lite/tp_utils.py`](mamba_lite/tp_utils.py) | FP16 and INT8 collectives (INT8 = per-token-scaled all-gather, int8 on the wire), selectable per collective site; KL/Top-k eval harness in [`mamba_lite/quant_eval.py`](mamba_lite/quant_eval.py). |
 | CUDA graphs | [`mamba_lite/cuda_graph.py`](mamba_lite/cuda_graph.py) | Graph-captured decode with a numerical correctness check run before any speedup is reported. |
 
 ## Setup
@@ -58,7 +59,8 @@ python3 -m venv .venv
 - `test_correctness.py` — Mamba forward pass vs. Hugging Face's `MambaForCausalLM`.
 - `test_tp_correctness.py` — 2-process (`gloo`) tensor-parallel correctness, AllReduce count, and the naive-sharding failure case.
 - `test_tp_lm_correctness.py` — same, for the full stacked model.
-- `test_quantized_allreduce.py` — quantized AllReduce correctness and the accuracy table above.
+- `test_quantized_allreduce.py` — quantized AllReduce correctness and a Top-1/Top-5 accuracy table.
+- `test_per_site_allreduce.py` — per-collective dtype lookup, collective counts, and the INT8 variants (real int8 on the wire, identical results on all ranks).
 
 ## Benchmarks
 
@@ -70,6 +72,10 @@ python3 -m venv .venv
 torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend gloo --device cpu   # local smoke test
 torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend nccl --device cuda \
   --compare-single-gpu --profile --allreduce-dtype fp16   # real 2-GPU box (e.g. Kaggle "GPU T4 x2")
+
+# Mixed-precision AllReduce accuracy (CPU) and speed (2 GPUs); see benchmarks/PHASE6_RESULTS.md
+.venv/bin/python scripts/phase6_eval.py --n 100 --len 256
+torchrun --standalone --nproc_per_node=2 scripts/phase6_gpu_bench.py
 
 # CUDA graph decode speedup, verified correct, same-session A/B (needs a real GPU)
 torchrun --standalone --nproc_per_node=2 scripts/run_tp.py --backend nccl --device cuda \

@@ -1,0 +1,4 @@
+{
+  "mixed_1fp16": {"default": "int8", "overrides": {"23:out_proj": "fp16"}},
+  "mixed_5fp16": {"default": "int8", "overrides": {"23:out_proj": "fp16", "22:out_proj": "fp16", "21:out_proj": "fp16", "20:out_proj": "fp16", "0:out_proj": "fp16"}}
+}
