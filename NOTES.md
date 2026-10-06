@@ -172,3 +172,35 @@ the fix/contribution. Kept updated as we go, not reconstructed at the end.
   was built *before* trusting the first "captured, 2-3x faster" result, and
   it caught a bug that a napkin-math sanity check ("the number looks
   plausible") would never have surfaced.
+
+## Phase 6 — Mixed-precision AllReduce
+
+- **Goal:** find which of the 48 collectives (2 per layer x 24 layers) tolerate
+  INT8, put only those in INT8, and see whether it makes inference faster.
+- **Action:** per-site dtype hook (`site_dtype`, keyed by layer + x_proj/out_proj);
+  new INT8 variants (`int8_sum`, `int8_gather`, `int8_gather_tok`); eval harness
+  (`mamba_lite/quant_eval.py`: KL / Top-1 / Top-5 vs fp32 on Simple English
+  Wikipedia); single-site sweeps, Pareto curve and greedy search; one
+  back-to-back 2xT4 benchmark (`scripts/phase6_gpu_bench.py`).
+- **Result:** accuracy yes, speed no. 43/48 collectives in INT8 (5 out_proj kept
+  fp16) gives KL 0.0005, Top-1 98.8%; layer 23 out_proj alone is ~80% of the
+  all-INT8 damage. On 2xT4 nothing beats fp32 by more than FP16's ~+5% prefill;
+  INT8 variants are ~30% slower on decode. Full numbers: `benchmarks/PHASE6_RESULTS.md`.
+- **Unexpected:**
+  1. Phase 4's INT8 sent int32 through the SUM collective, so it saved no
+     bandwidth at all. Caught while planning the speed test, before measuring.
+  2. INT8's bad accuracy was the scale, not the 8 bits: one scale per tensor
+     gave KL 0.65; one scale per token gave 0.013.
+  3. Phase 4's accuracy numbers (42 tokens) reproduced almost exactly on 100
+     passages x 256 tokens, so the small test was fine.
+  4. Prefill is only ~5-9% communication at this size, which caps any gain.
+     The prediction from Phase 3 ("quantization helps where bandwidth-bound")
+     held directionally but the effect is small for a 130m model.
+  5. Graphed fp32 decode was 5.7x faster than eager in this session vs 2.5-3.7x
+     in Phase 5: the graphed side was faster; likely host variance.
+- **Fix:** int8 on the wire via all-gather of packed int8 + per-row scales
+  (also removes the scale-sync collective and the `.item()` sync, so INT8
+  becomes CUDA-graph capturable; verified bit-exact vs eager on NCCL).
+- **Contribution:** the per-site sensitivity map and the honest negative speed
+  result; static (calibrated) scales were deliberately not built since the
+  decode cost is kernel count, not just the scale step (untested judgment).
